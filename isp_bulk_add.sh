@@ -1,142 +1,99 @@
 #!/bin/bash
 
-# isp_bulk_add.sh — массовое добавление сайтов в ISPmanager
-# Поддержка Let's Encrypt, SSL, HTTP/2, редиректов, идемпотентность
-# Требуется: root-доступ, доступность утилиты mgrctl (ISPmanager >= v6)
+# isp_bulk_add.sh — добавление сайтов в ISPmanager с Let's Encrypt
 
 DOMAINS_FILE="domains.txt"
 LOG_FILE="isp_bulk_add.log"
 ENCODING_TOOL="idn"
-MAX_RETRIES=3
-RETRY_DELAY=5
+MGRCTL="/usr/local/mgr5/sbin/mgrctl"
 SERVER_IP=$(curl -s https://api.ipify.org)
 
+# Проверка запуска от root
 if [[ "$EUID" -ne 0 ]]; then
-  echo "Скрипт должен запускаться от имени root." | tee -a "$LOG_FILE"
+  echo "Ошибка: запустите скрипт от root (например: sudo ./isp_bulk_add.sh)"
   exit 1
 fi
 
-REQUIRED_CMDS=("mgrctl" "curl" "$ENCODING_TOOL")
-for cmd in "${REQUIRED_CMDS[@]}"; do
+# Проверка команд
+for cmd in curl "$ENCODING_TOOL"; do
   if ! command -v "$cmd" &>/dev/null; then
-    echo "Ошибка: Не найдена утилита $cmd" | tee -a "$LOG_FILE"
+    echo "Ошибка: команда $cmd не найдена. Установите её."
     exit 1
   fi
 done
 
+if [[ ! -x "$MGRCTL" ]]; then
+  echo "Ошибка: ISPmanager не найден по пути $MGRCTL"
+  exit 1
+fi
+
+# Удобный вывод
 log() {
-  local level="$1"
-  local message="$2"
-  echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$level] $message" | tee -a "$LOG_FILE"
+  echo "[ $(date +'%F %T') ] $1"
+  echo "[ $(date +'%F %T') ] $1" >> "$LOG_FILE"
 }
 
 site_exists() {
-  local domain="$1"
-  local result
-  result=$(mgrctl -m ispmgr webdomain | grep -o "\"name\":\"$domain\"")
-  [[ -n "$result" ]]
-}
-
-validate_domain() {
-  local domain="$1"
-  if [[ ! "$domain" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z]{2,})+$ ]]; then
-    log "ERROR" "Некорректный формат домена: $domain"
-    return 1
-  fi
-  return 0
-}
-
-check_dns() {
-  local domain="$1"
-  if ! host "$domain" | grep -q "$SERVER_IP"; then
-    log "ERROR" "DNS домена $domain не указывает на IP $SERVER_IP"
-    return 1
-  fi
-  return 0
+  "$MGRCTL" -m ispmgr webdomain | grep -q "\"name\":\"$1\""
 }
 
 create_site_directory() {
   local domain="$1"
   local dir="/var/www/www-root/data/www/$domain"
-
-  if [[ ! -d "$dir" ]]; then
-    if ! mkdir -p "$dir" 2>/dev/null; then
-      log "ERROR" "Не удалось создать директорию $dir"
-      return 1
-    fi
-    chown www-root:www-root "$dir"
-    chmod 755 "$dir"
-  fi
-  return 0
+  mkdir -p "$dir"
+  chown www-root:www-root "$dir"
+  chmod 755 "$dir"
 }
 
 add_site() {
   local domain="$1"
-  local retry_count=0
-  log "INFO" "Обработка домена: $domain"
+  log "Обрабатываем: $domain"
 
-  if ! validate_domain "$domain"; then
-    return 1
+  # Проверка домена
+  if [[ ! "$domain" =~ ^[a-zA-Z0-9а-яА-ЯёЁ.-]+$ ]]; then
+    log "Ошибка: некорректный домен '$domain'"
+    return
   fi
 
-  local punycode_domain
+  # Punycode
   punycode_domain=$($ENCODING_TOOL -a "$domain")
   if [[ -z "$punycode_domain" ]]; then
-    log "ERROR" "Не удалось сконвертировать $domain в Punycode"
-    return 1
+    log "Ошибка: не удалось преобразовать $domain в punycode"
+    return
   fi
 
+  # Уже есть?
   if site_exists "$punycode_domain"; then
-    log "INFO" "Сайт $punycode_domain уже существует, пропускаем."
-    return 0
+    log "Пропущено: $punycode_domain уже добавлен"
+    return
   fi
 
-  if ! check_dns "$domain"; then
-    return 1
+  # DNS проверка
+  if ! host "$domain" | grep -q "$SERVER_IP"; then
+    log "Ошибка: DNS $domain не указывает на $SERVER_IP"
+    return
   fi
 
-  if ! create_site_directory "$punycode_domain"; then
-    return 1
-  fi
+  create_site_directory "$punycode_domain"
 
-  local docroot="/var/www/www-root/data/www/$punycode_domain"
+  # Добавление
+  "$MGRCTL" -m ispmgr webdomain.add \
+    name="$punycode_domain" \
+    ssl="on" http2="on" redirect_http="on" \
+    letsenctype="on" le_ssl="on" su="www-root" \
+    docroot="/var/www/www-root/data/www/$punycode_domain"
 
-  while [[ $retry_count -lt $MAX_RETRIES ]]; do
-    if mgrctl -m ispmgr webdomain.add name="$punycode_domain" ssl="on" http2="on" redirect_http="on" letsenctype="on" le_ssl="on" su="www-root" docroot="$docroot"; then
-      break
-    fi
-    retry_count=$((retry_count + 1))
-    if [[ $retry_count -lt $MAX_RETRIES ]]; then
-      log "WARNING" "Попытка $retry_count из $MAX_RETRIES не удалась, повтор через $RETRY_DELAY секунд"
-      sleep $RETRY_DELAY
-    else
-      log "ERROR" "Ошибка при создании сайта $punycode_domain после $MAX_RETRIES попыток"
-      return 1
-    fi
-  done
-
-  log "INFO" "Проверка SSL для $punycode_domain"
-  if ! mgrctl -m ispmgr webdomain param="ssl" name="$punycode_domain" | grep -q "\"ssl\":\"on\""; then
-    log "ERROR" "SSL не активирован для $punycode_domain"
-    return 1
-  fi
-
-  log "SUCCESS" "Сайт $punycode_domain успешно добавлен и настроен"
-  return 0
+  log "Сайт $punycode_domain добавлен"
 }
 
+# Проверки перед выполнением
 if [[ ! -f "$DOMAINS_FILE" ]]; then
-  log "ERROR" "Файл $DOMAINS_FILE не найден"
+  log "Ошибка: файл $DOMAINS_FILE не найден"
   exit 1
 fi
 
-if [[ ! -r "$DOMAINS_FILE" ]]; then
-  log "ERROR" "Нет прав на чтение файла $DOMAINS_FILE"
-  exit 1
-fi
-
+# Основной цикл
 while IFS= read -r domain || [[ -n "$domain" ]]; do
-  [[ -z "$domain" || "$domain" =~ ^[[:space:]]*# ]] && continue
-  domain=$(echo "$domain" | xargs)
+  [[ -z "$domain" || "$domain" =~ ^# ]] && continue
   add_site "$domain"
 done < "$DOMAINS_FILE"
